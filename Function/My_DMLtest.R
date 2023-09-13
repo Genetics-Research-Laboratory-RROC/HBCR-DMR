@@ -1,0 +1,576 @@
+######################################################################
+##
+## a list of functions for testing DML from Bisulfite seq data
+##
+######################################################################
+
+######################################
+## wrapper function for DML test
+######################################
+My_DMLtest <- function(BSobj, group1, group2, equal.disp=FALSE, smoothing=FALSE, smoothing.span=500) {
+  ## grab two group data
+  tmp <- getBSseqIndex(sampleNames(BSobj), group1, group2)
+  BS1 <- BSobj[,tmp$group1]
+  BS2 <- BSobj[,tmp$group2]
+  
+  ## remove loci with all 0 coverages in a condition
+  ## It's not required that all replicates have coverage.
+  ## But there must be some coverage from at least one replicate.
+  n1 <- as.array(bsseq::getBSseq(BS1, "Cov"))
+  n2 <- as.array(bsseq::getBSseq(BS2, "Cov"))
+  ## remove if a rather long strech (like 200 bps) of regions have no coverage
+  allpos <- start(BSobj)
+  ix1 <- hasCoverage(n1, allpos)
+  ix2 <- hasCoverage(n2, allpos)
+  ix <- ix1 & ix2
+  BS1 <- BS1[ix]
+  BS2 <- BS2[ix]
+  
+  ## Check the consistence of inputs
+  nreps1 <- dim(BS1)[2]
+  nreps2<- dim(BS2)[2]
+  if( (nreps1==1 | nreps2==1) & !equal.disp ) { ## singel replicate case, and unequal dispersion in two groups
+    if( !smoothing )
+      stop("There is no biological replicates in at least one condition. Please set smoothing=TRUE or equal.disp=TRUE and retry.")
+  }
+  
+  if(!smoothing) { ## no smoothing.
+    dmls <- DMLtest.noSmooth(BS1, BS2, equal.disp)
+  } else { ## smoothing version
+    dmls <- DMLtest.Smooth(BS1, BS2, equal.disp, smoothing.span)
+  }
+  
+  class(dmls)[2] = "DMLtest"
+  invisible(dmls)
+}
+
+##################################################
+## determine sample index from a BSseq object
+##################################################
+getBSseqIndex <- function(sName, group1, group2) {
+  check <- function(group, id) {
+    thisGrp = paste("group", id, sep="")
+    
+    if (is.character(group)) {
+      if(!all(group %in% sName))
+        stop("Some sample names not found in", thisGrp)
+      group <- match(group, sName)
+    }
+    if (is.numeric(group)) {
+      if(min(group) < 1 | max(group) > length(sName))
+        stop("Some group indices are wrong in", thisGrp)
+    }
+    else stop(paste("problems with argument", thisGrp))
+    group
+  }
+  
+  group1 <- check(group1, 1)
+  group2 <- check(group2, 2)
+  
+  if(length(intersect(group1, group2)) > 0)
+    stop("Two groups have common sample.")
+  
+  if(length(group1) <= 0)
+    stop("group1 not found.")
+  if(length(group2) <= 0)
+    stop("group2 not found.")
+  
+  list(group1=group1, group2=group2)
+}
+
+
+######################################
+## test DML without smoothing
+######################################
+DMLtest.noSmooth <- function(BS1, BS2, equal.disp) {
+  ## grab counts
+  x1 <- as.array(bsseq::getCoverage(BS1, type="M"))
+  n1 <- as.array(bsseq::getCoverage(BS1, type="Cov"))
+  x2 <- as.array(bsseq::getCoverage(BS2, type="M"))
+  n2 <- as.array(bsseq::getCoverage(BS2, type="Cov"))
+  nreps1 <- ncol(x1)
+  nreps2 <- ncol(x2)
+  
+  ## estimate means
+  estprob1 <- compute.mean.noSmooth(x1, n1)
+  estprob2 <- compute.mean.noSmooth(x2, n2)
+  
+  ## estimate dispersion
+  ## - this part is slow. Could be computed parallely. Will implement later.
+  cat("Estimating dispersion for each CpG site, this will take a while ...\n")
+  if(equal.disp | nreps1==1 | nreps2==1) {
+    phi1 <- phi2 <- est.dispersion.BSseq(cbind(x1,x2), cbind(n1,n2), cbind(estprob1, estprob2))
+  } else {
+    phi1 <- est.dispersion.BSseq(x1, n1, estprob1)
+    phi2 <- est.dispersion.BSseq(x2, n2, estprob2)
+  }
+  
+  ## weight the counts
+  wt1 <- 1 / (1+(n1-1)*phi1);    wt1 <- wt1 / mean(wt1)
+  wt2 <- 1 / (1+(n2-1)*phi2);    wt2 <- wt2 / mean(wt2)
+  x1.wt <- x1*wt1
+  n1.wt <- n1*wt1
+  x2.wt <- x2*wt2
+  n2.wt <- n2*wt2
+  
+  ## re-estimate means
+  estprob1 <- compute.mean.noSmooth(x1.wt, n1.wt)
+  estprob2 <- compute.mean.noSmooth(x2.wt, n2.wt)
+  
+  ## perform Wald test
+  allchr <- as.character(seqnames(BS1))
+  allpos <- start(BS1)
+  wald <- waldTest.DML(x1.wt, n1.wt, estprob1, phi1, x2.wt, n2.wt, estprob2, phi2,
+                       smoothing=FALSE, allchr=allchr, allpos=allpos)
+  return(wald)
+}
+
+######################################
+## test DML with smoothing
+######################################
+DMLtest.Smooth <- function(BS1, BS2, equal.disp, smoothing.span) {
+  ## grab counts
+  x1 <- as.array(bsseq::getCoverage(BS1, type="M"))
+  n1 <- as.array(bsseq::getCoverage(BS1, type="Cov"))
+  x2 <- as.array(bsseq::getCoverage(BS2, type="M"))
+  n2 <- as.array(bsseq::getCoverage(BS2, type="Cov"))
+  nreps1 <- ncol(x1)
+  nreps2 <- ncol(x2)
+  allchr <- as.character(seqnames(BS1))
+  allpos <- start(BS1)
+  
+  ## Smoothing
+  cat("Smoothing ...\n")
+  estprob1 <- compute.mean.Smooth(x1, n1, allchr, allpos, smoothing.span)
+  estprob2 <- compute.mean.Smooth(x2, n2, allchr, allpos, smoothing.span)
+  
+  ## estimate priors from counts
+  cat("Estimating dispersion for each CpG site, this will take a while ...\n")
+  if(equal.disp) {
+    phi1 <- phi2 <- est.dispersion.BSseq(cbind(x1,x2), cbind(n1,n2), cbind(estprob1, estprob2))
+  } else {
+    phi1 <- est.dispersion.BSseq(x1, n1, estprob1)
+    phi2 <- est.dispersion.BSseq(x2, n2, estprob2)
+  }
+  
+  ## update counts - weight by dispersion
+  wt1 <- 1 / (1+(n1-1)*phi1); wt1 <- wt1 / mean(wt1)
+  wt2 <- 1 / (1+(n2-1)*phi2); wt2 <- wt2 / mean(wt2)
+  x1.wt <- x1*wt1
+  n1.wt <- n1*wt1
+  x2.wt <- x2*wt2
+  n2.wt <- n2*wt2
+  
+  ## re-estimate means
+  estprob1 <- compute.mean.Smooth(x1.wt, n1.wt, allchr, allpos, smoothing.span)
+  estprob2 <- compute.mean.Smooth(x2.wt, n2.wt, allchr, allpos, smoothing.span)
+  
+  cat("Computing test statistics ...\n")
+  wald <- waldTest.DML(x1.wt, n1.wt, estprob1, phi1, x2.wt, n2.wt, estprob2, phi2,
+                       smoothing=TRUE, smoothing.span, allchr=allchr, allpos=allpos)
+  ##     wald <- waldTest.DML(x1, n1, estprob1, phi1, x2, n2, estprob2, phi2,
+  ##                          smoothing=TRUE, smoothing.span, allchr=allchr, allpos=allpos)
+  
+  return(wald)
+}
+
+
+###############################################################################
+## Perform Wald tests for calling DML
+###############################################################################
+waldTest.DML <- function(x1,n1,estprob1, phi1, x2,n2, estprob2, phi2, smoothing,
+                         smoothing.span, allchr, allpos) {
+  
+  ## Wald test
+  if(smoothing) {
+    wald <- compute.waldStat.Smooth(estprob1[,1], estprob2[,1], n1, n2, phi1, phi2,
+                                    smoothing.span, allchr, allpos)
+  } else {
+    wald <- compute.waldStat.noSmooth(estprob1[,1], estprob2[,1], n1, n2, phi1, phi2)
+  }
+  
+  ## combine with chr/pos and output
+  result <- data.frame(chr=allchr, pos=allpos, wald)
+  ## remove NA entries - Maybe I should keep them so result have the same dimension as inputs???
+  # ii <- !is.na(result$stat)
+  # result <- result[ii,]
+  
+  ## sort result according to chr and pos - maybe this is not important??
+  ix <- sortPos(result$chr, result$pos)
+  result <- result[ix,]
+  return(result)
+}
+
+###########################################################
+## compute Wald test statistics when there's no smoothing
+###########################################################
+compute.waldStat.noSmooth <- function(estprob1, estprob2, n1, n2, phi1, phi2) {
+  ##rowSums <- DelayedArray::rowSums
+  dif <- estprob1 - estprob2
+  n1m <- rowSums(n1);    n2m <- rowSums(n2)
+  var1 <- rowSums(n1*estprob1*(1-estprob1)*(1+(n1-1)*phi1)) / (n1m)^2
+  var2 <- rowSums(n2*estprob2*(1-estprob2)*(1+(n2-1)*phi2)) / (n2m)^2
+  # ##vv <- var1/ncol1+var2/ncol2
+  # vv <- var1 + var2
+  # ## bound vv a little bit??
+  # vv[vv<1e-5] <- 1e-5
+  # se <- sqrt(vv)
+  # stat <- dif/se
+  # pval <- 2 * pnorm(-abs(stat)) ## p-value for hypothesis testing
+  # fdr <- p.adjust(pval, method="fdr")
+  # data.frame(mu1=estprob1, mu2=estprob2, diff=dif, diff.se=se, stat=stat,
+  #            phi1=phi1, phi2=phi2, pval=pval, fdr=fdr)
+  
+  data.frame(mu1=estprob1, mu2=estprob2, var1 = var1, var2 = var2)
+}
+
+###########################################################
+## compute Wald test statistics when there is smoothing
+## Note that the variance computation is different when there's smoothing!!!
+## The variances will be smaller in the CG dense regions.
+## This is reasonable because there're more data points in smoothing.
+## But does it make sense biologically???
+###########################################################
+compute.waldStat.Smooth <- function(estprob1, estprob2, n1, n2, phi1, phi2, smoothing.span,
+                                    allchr, allpos) {
+  # dif <- estprob1 - estprob2
+  ## compute variances for moving average values. This is tricky!
+  var1 <- compute.var.Smooth(estprob1, n1, phi1, smoothing.span, allchr, allpos)
+  var2 <- compute.var.Smooth(estprob2, n2, phi2, smoothing.span, allchr, allpos)
+  # 
+  # ##  var1 <- compute.var.Smooth.old(estprob1, n1, phi1, smoothing.span, allchr, allpos)
+  # ##  var2 <- compute.var.Smooth.old(estprob2, n2, phi2, smoothing.span, allchr, allpos)
+  # 
+  # vv <- var1 + var2
+  # ## bound vv a little bit
+  # vv[vv<1e-5] <- 1e-4
+  # vv[vv> 1- 1e-5] <- 1-1e-4
+  # 
+  # se <- sqrt(vv)
+  # stat <- dif/se
+  # pval <- 2 * pnorm(-abs(stat)) ## p-value for hypothesis testing
+  # fdr <- p.adjust(pval, method="fdr")
+  # data.frame(mu1=estprob1, mu2=estprob2, diff=dif, diff.se=se, stat=stat,
+  #            phi1=phi1, phi2=phi2, pval=pval, fdr=fdr)
+  data.frame(mu1=estprob1, mu2=estprob2, var1 = var1, var2 = var2)
+}
+
+
+################################################################
+## function to compute the variance for moving average values
+################################################################
+compute.var.Smooth <- function(estprob1, n1, phi1, smoothing.span, allchr, allpos) {
+  nreps <- ncol(n1)
+  ## estimate distance-dependent autocorrelations
+  ## rhos <- est.rho(estprob1, allchr, allpos)
+  ## autocorrelation.
+  rho <- 0.8
+  ## rho <- acf(estprob1, 1, plot=FALSE)$acf[2]  ## lag-1 autocorrelation, use 0.8 fixed
+  ## compute vars for each replicate
+  vars.rep <- matrix(0, nrow=nrow(n1), ncol=nreps)
+  idx <- split(1:length(allchr), allchr)
+  
+  ## note the smoothed value were calculated with a small constant added to N and X.
+  ## Need to account for that!!!
+  const <- 1/ncol(n1)
+  n1 <- n1 + const
+  
+  for(irep in 1:nreps) { ## loop on replicates
+    ## variances at each position
+    vars <- n1[,irep] * estprob1*(1-estprob1) * (1+(n1[,irep]-1)*phi1)
+    ## 'vars' could be a DelayedArray object so turn it into an ordinary
+    ## array
+    vars <- as.array(vars)
+    ## compute covariances - do by chr
+    tmp1 <- estprob1*(1-estprob1)*phi1
+    vars.smooth <- rep(0, length(allchr))
+    for(i in seq(along=idx)) { ## loop on chromosomes
+      thisidx <- idx[[i]]
+      vars.smooth[idx[[i]]]=.Call( "compute_var_smooth", vars[thisidx], tmp1[thisidx],
+                                   as.double(n1[thisidx,irep]), as.integer(allpos[thisidx]),
+                                   as.integer(smoothing.span), as.double(rho) )
+    }
+    vars.rep[,irep] <- vars.smooth
+  }
+  ## compute denominators
+  flag <- "sum"
+  n1.sm <- as.array(n1)
+  for(i in 1:nreps)
+    n1.sm[,i] <- smooth.chr(as.double(n1[,i]), smoothing.span, allchr, allpos, flag)
+  denom <- rowSums(n1.sm) ^ 2
+  ## results
+  vars <- rowSums(vars.rep) / denom
+  vars
+}
+
+
+
+################################################################
+## old function to compute the variance for moving average values.
+## This uses an approximation that will speed up the calculation.
+################################################################
+compute.var.Smooth.old <- function(estprob1, n1, phi1, smoothing.span, allchr, allpos) {
+  ## variance of X at each position for each replicate
+  var1.X <- (n1*estprob1*(1-estprob1)*(1+(n1-1)*phi1))
+  
+  ## Consider the smoothing effect
+  n1.sm <- n1
+  var1.X.sm <- var1.X
+  nCG1 <- n1
+  
+  flag <- "sum"
+  for(i in 1:ncol(n1)) {
+    n1.sm[,i] <- smooth.chr(as.double(n1[,i]), smoothing.span, allchr, allpos, flag)
+    var1.X.sm[,i] <- smooth.chr(as.double(var1.X[,i]), smoothing.span, allchr, allpos, flag)
+    nCG1[,i] <- smooth.chr(rep(1.0, nrow(n1)), smoothing.span, allchr, allpos, flag)
+  }
+  ## adjust for correlation - this is very crude, but serve the purpose
+  ## Need to work this out !!!!
+  var1.X.sm2 <- var1.X.sm #* nCG1 * 0.1
+  n1m <- rowSums(n1.sm)
+  var1 <- rowSums(var1.X.sm2) / n1m^2
+  var1
+}
+
+################################################
+## wrapper function for calling DML
+################################################
+callDML <- function(DMLresult, delta=0.1, p.threshold=1e-5) {
+  
+  if(class(DMLresult)[2] == "DMLtest.multiFactor" & delta>0) {
+    warning("'delta' cannot be specified for multiple-factor test results. Set delta=0 and proceed ...\n")
+    delta = 0
+  }
+  
+  ## obtain posterior probability that the differnce of two means are greater than a threshold
+  if( delta > 0 ) {
+    p1 <- pnorm(DMLresult$diff-delta, sd=DMLresult$diff.se) ## Pr(delta.mu > delta)
+    p2 <- pnorm(DMLresult$diff+delta, sd=DMLresult$diff.se, lower.tail=FALSE) ## Pr(-delta.mu < -delta)
+    postprob.overThreshold <- p1 + p2
+    DMLresult <- data.frame(DMLresult, postprob.overThreshold=postprob.overThreshold)
+    scores <- 1 - postprob.overThreshold
+  } else {
+    scores <- DMLresult$pval
+  }
+  
+  ix <- scores < p.threshold
+  result <- DMLresult[ix,]
+  
+  ## sort by score
+  ii <- sort(scores[ix], index.return=TRUE)$ix
+  result[ii,]
+  
+}
+
+
+####################################################################
+## function to determine what loci to keep, based on coverage depth
+####################################################################
+hasCoverage <- function(nn, allpos, thresh=2) {
+  nn2 <- rowSums(nn)
+  ws <- 200
+  flag <- 0
+  nn.sm <- .Call("windowFilter", as.double(nn2), as.integer(allpos), as.integer(ws), as.integer(flag))
+  nn.sm > thresh*ncol(nn)
+}
+
+
+######################################################################################
+## function to compute means when there's no smoothing.
+## Just compute the percentage of methylation.
+## adding a small constant could bring trouble when there's no coverage!!!
+######################################################################################
+compute.mean.noSmooth <- function(X, N) {
+  p <- X/N
+  ##rowSums <- DelayedArray::rowSums
+  const <- mean(p, na.rm=TRUE)
+  p <- (rowSums(X)+const)/(rowSums(N)+1)
+  
+  nreps <-  ncol(N)
+  res <- matrix(rep(p, nreps), ncol = nreps)
+  return(res)
+}
+
+
+########################################################################
+## estimate dispersion for BS-seq data, given means
+########################################################################
+est.dispersion.BSseq <- function(X, N, estprob) {
+  prior <- est.prior.BSseq.logN(X, N)
+  dispersion.shrinkage.BSseq(X, N, prior, estprob)
+}
+
+########################################################################
+## A function to estimate dipersion prior for BS-seq, assuming log-normal prior.
+## It takes X and N, and only use the sites with big coverages,
+## then return the mean and sd of prior distribution.
+##
+## For single rep data: will use logN(-3,1) as prior.
+########################################################################
+est.prior.BSseq.logN <- function(X, N) {
+  ## rowMeans = DelayedArray::rowMeans
+  ## rowSums = DelayedArray::rowSums
+  
+  if(ncol(X) == 1) ## single rep
+    return(c(-3, 1))
+  
+  ## keep sites with large coverage and no missing data
+  ix=rowMeans(N>10)==1 & rowSums(N==0)==0
+  if(sum(ix) < 50) {
+    warning("The coverages are too low. Cannot get good estimations of prior. Use arbitrary prior N(-3,1).")
+    return(c(-3, 1))
+  }
+  
+  X=X[ix,,drop=FALSE]; N=N[ix,,drop=FALSE]
+  ## compute sample mean/var
+  p=X/N
+  mm=rowMeans(p)
+  mm[mm==0]=1e-5
+  mm[mm==1]=1-1e-5
+  vv=rowVars(p)
+  phi=vv/mm/(1-mm)
+  ## exclude those with vv==0. Those are sites with unobservable phis.
+  ## But this will over estimate the prior.
+  ## What will be the consequences????
+  phi=phi[vv>0]
+  lphi=log(phi[phi>0])
+  prior.mean=median(lphi, na.rm=TRUE)
+  prior.sd=IQR(lphi, na.rm=TRUE) /1.39
+  
+  ## It seems this over-estimates the truth. Need to use the tricks in
+  ## my biostat paper to remove the over-estimation. To be done later.
+  c(prior.mean, prior.sd)
+}
+
+########################################################################
+## Dispersion shrinkage based on log-normal penalized likelihood.
+## Takes X, N, estimated mean and prior.
+##
+## The shrinakge is done in log scale. So data will be shrink to the
+## logarithmic means.
+########################################################################
+dispersion.shrinkage.BSseq <- function(X, N, prior, estprob) {
+  ## penalized likelihood function
+  plik.logN <- function(size, X,mu,m0,tau,phi)
+    -(sum(dbb(size, X, mu, exp(phi))) + dnorm(phi, mean=m0, sd=tau, log=TRUE))
+  
+  ## for CG sites with no coverage, use prior
+  shrk.phi=exp(rep(prior[1],nrow(N)))
+  
+  ## deal with estprob, make it a matrix if not.
+  if(!is.matrix(estprob))
+    estprob <- as.matrix(estprob)
+  
+  ## skip those without coverage
+  ix <- rowSums(N>0) > 0
+  X2 <- X[ix, ,drop=FALSE]; N2 <- N[ix,,drop=FALSE]; estprob2 <- estprob[ix,,drop=FALSE]
+  shrk.phi2 <- rep(0, nrow(X2))
+  
+  ## setup a progress bar
+  nCG.pb = round(nrow(X2)/100)
+  pb <- txtProgressBar(style = 3)
+  for(i in 1:nrow(X2)) {
+    ## print a progress bar
+    if((i %% nCG.pb) == 0)
+      setTxtProgressBar(pb, i/nrow(X2))
+    ## I can keep the 0's with calculation. They don't make any difference.
+    shrk.one=optimize(f=plik.logN, size=N2[i,], X=X2[i,], mu=estprob2[i,], m0=prior[1], tau=prior[2],
+                      interval=c(-5, log(0.99)),tol=1e-3)
+    shrk.phi2[i]=exp(shrk.one$minimum)
+  }
+  setTxtProgressBar(pb, 1)
+  cat("\n")
+  shrk.phi[ix] <- shrk.phi2
+  
+  return(shrk.phi)
+}
+
+
+#########################################################
+## beta-binomial (BB) density function.
+## The BB distribution is parametrized by mean and dispersion.
+#########################################################
+dbb <- function (size, x, mu, phi, log=TRUE)  {
+  ## 'size' and/or 'x' could be DelayedArray objects so turn them into
+  ## ordinary arrays
+  size=as.array(size)
+  x=as.array(x)
+  ## first convert mu/phi to alpha/beta
+  tmp=1/phi-1
+  alpha=mu*tmp
+  beta=tmp - alpha  ##??
+  v=lchoose(size,x)-lbeta(beta, alpha)+lbeta(size-x + beta,x+alpha)
+  if(!log)
+    return(exp(v))
+  else return(v)
+}
+
+###########################################
+## sort according to chr and pos.
+## Return the index
+###########################################
+sortPos <- function(chr, pos) {
+  do.call(order, list(chr, pos))
+}
+
+
+######################################################################################
+## function to compute means when there's smoothing.
+## Currently it doesn't do anything except calling smooth.collapse.
+## Might add things later.
+######################################################################################
+compute.mean.Smooth <- function(X, N, allchr, allpos, ws=500) {
+  ## rowSums <- DelayedArray::rowSums
+  
+  ## collapse the replicates and smoothing
+  nreps <-  ncol(N)
+  p1 <- X / N
+  const <-  mean(p1, na.rm=TRUE) ##  small constant to be added
+  if(nreps>1) { ## multiple replicate, collapse them. Add a small constant to bound away from 0/1
+    N <- rowSums(N)+1
+    X <- rowSums(X)+const
+  } else {
+    N <- N+0.4
+    X <- X+0.4*const
+  }
+  ## smooth and compute p
+  X.sm <- smooth.chr(as.double(X), ws, allchr, allpos)
+  N.sm <- smooth.chr(as.double(N), ws, allchr, allpos)
+  p <- X.sm / N.sm
+  
+  res <- matrix(rep(p, nreps), ncol = nreps)
+  return(res)
+}
+
+
+
+##############################################
+## Smoothing function. Smooth by chr
+###############################################
+smooth.chr <- function(x, ws, allchr, allpos, method=c("avg", "sum")) {
+  method <- match.arg(method)
+  if(method == "avg")
+    flag = 1
+  else
+    flag = 0
+  
+  ## remove NA's
+  ix = !is.na(x)
+  x2 = x[ix]
+  allchr2 = allchr[ix]
+  allpos2 = allpos[ix]
+  
+  n0=length(x2)
+  idx=split(1:n0, allchr2)
+  res2=rep(0, n0)
+  for(i in seq(along=idx)) {
+    res2[idx[[i]]]=.Call("windowFilter", x2[idx[[i]]], as.integer(allpos2[idx[[i]]]), as.integer(ws), as.integer(flag))
+  }
+  
+  if(sum(ix) > 0) {
+    res = rep(NA, length(x))
+    res[ix] = res2
+  } else res = res2
+  
+  return(res)
+}
